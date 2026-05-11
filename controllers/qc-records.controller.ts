@@ -765,6 +765,24 @@ export const getQCRecords = async (req: Request, res: Response) => {
   const connection = await get_db_connection();
 
   try {
+    // First, get dates that have been audited for each QA agent
+    const auditedDatesSql = `
+      SELECT DISTINCT 
+        q.qa_user_id,
+        DATE(q.updated_at) as audit_date
+      FROM qc_records q
+      INNER JOIN qc_audit qa ON q.id = qa.qc_record_id
+    `;
+    
+    const [auditedDates] = await connection.execute(auditedDatesSql);
+    
+    // Create a Set of audited date combinations for quick lookup
+    const auditedDateSet = new Set();
+    (auditedDates as any[]).forEach(row => {
+      auditedDateSet.add(`${row.qa_user_id}_${row.audit_date}`);
+    });
+
+    // Get only the earliest record per QA agent per day (non-audited)
     let sql = `
       SELECT 
         q.*,
@@ -772,28 +790,65 @@ export const getQCRecords = async (req: Request, res: Response) => {
         qa.user_name as qa_name,
         am.user_name as am_name,
         p.project_name,
-        t.task_name
+        t.task_name,
+        DATE(q.updated_at) as record_date
       FROM qc_records q
       LEFT JOIN tfs_user a ON q.agent_id = a.user_id
       LEFT JOIN tfs_user qa ON q.qa_user_id = qa.user_id
       LEFT JOIN tfs_user am ON q.assistant_manager_id = am.user_id
       LEFT JOIN project p ON q.project_id = p.project_id
       LEFT JOIN task t ON q.task_id = t.task_id
+      LEFT JOIN qc_audit qa_audit ON q.id = qa_audit.qc_record_id
+      WHERE qa_audit.qc_record_id IS NULL
+        AND q.qa_user_id IS NOT NULL
+        AND q.id = (
+          SELECT MIN(q2.id) 
+          FROM qc_records q2 
+          WHERE q2.qa_user_id = q.qa_user_id 
+            AND DATE(q2.updated_at) = DATE(q.updated_at)
+            AND q2.id NOT IN (
+              SELECT qa2.qc_record_id 
+              FROM qc_audit qa2 
+              WHERE qa2.qc_record_id = q2.id
+            )
+        )
     `;
 
     const queryParams: any[] = [];
 
     if (logged_in_user_id) {
-      sql += ` WHERE q.agent_id = ?`;
+      sql += ` AND q.agent_id = ?`;
       queryParams.push(logged_in_user_id);
     }
 
-    sql += ` ORDER BY q.created_at DESC`;
-
     const [rows] = await connection.execute(sql, queryParams);
     
+    // Filter out records where audit is already done for that QA agent and date
+    const filteredRecords = (rows as any[]).filter(record => {
+      const dateKey = `${record.qa_user_id}_${record.record_date}`;
+      const isAudited = auditedDateSet.has(dateKey);
+      
+      console.log(`[DEBUG] Record ${record.id}: qa_id=${record.qa_user_id}, date=${record.record_date}, audited=${isAudited}`);
+      
+      return !isAudited;
+    });
+    
+    console.log(`[DEBUG] Total records before filtering: ${(rows as any[]).length}`);
+    console.log(`[DEBUG] Total records after filtering: ${filteredRecords.length}`);
+
+    // Sort by QA agent name ASC, then by created_at DESC for final output
+    filteredRecords.sort((a: any, b: any) => {
+      // First sort by QA agent name ascending
+      const qaNameCompare = (a.qa_name || '').localeCompare(b.qa_name || '');
+      if (qaNameCompare !== 0) {
+        return qaNameCompare;
+      }
+      // Then sort by created_at descending
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+    
     // Format dates in the response
-    const formattedRows = formatDatesInRows(rows as any[], ['created_at', 'updated_at', 'date_of_file_submission']);
+    const formattedRows = formatDatesInRows(filteredRecords, ['created_at', 'updated_at', 'date_of_file_submission']);
     
     return res.status(200).json({ success: true, data: formattedRows });
   } catch (error) {
